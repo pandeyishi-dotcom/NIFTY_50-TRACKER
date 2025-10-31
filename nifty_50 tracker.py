@@ -103,7 +103,12 @@ df_final = pd.DataFrame(rows)
 # Nifty Impact Simulation
 # ------------------------
 nifty_move_points = [100, 200, 250, 300, 500]
-nifty_price = df_final["Price"].mean() * len(df_final) / 50  # rough proxy
+if "Price" in df_final.columns:
+    nifty_price = df_final["Price"].mean() * len(df_final) / 50  # rough proxy
+else:
+    st.warning("⚠️ 'Price' column missing — using default NIFTY index value for simulation.")
+    nifty_price = 22000  # fallback value (you can adjust to live NIFTY)
+
 impact_df = pd.DataFrame({
     "Nifty Move (pts)": nifty_move_points,
     "Impact (%)": [round((m / nifty_price) * 100, 2) for m in nifty_move_points]
