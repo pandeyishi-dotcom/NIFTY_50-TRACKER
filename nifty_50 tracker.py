@@ -44,8 +44,11 @@ ALPHA_KEY = os.environ.get("ALPHAVANTAGE_API_KEY") or st.secrets.get("ALPHAVANTA
 def format_mcap(x):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "N/A"
-    crores = x / 1e7
-    return f"{crores:,.2f} Cr"
+    try:
+        crores = float(x) / 1e7
+        return f"{crores:,.2f} Cr"
+    except Exception:
+        return "N/A"
 
 def safe_json(resp):
     try:
@@ -67,24 +70,27 @@ def fetch_alpha_global(ticker):
         "symbol": ticker,
         "apikey": ALPHA_KEY
     }
-    r = requests.get(url, params=params, timeout=10)
-    data = safe_json(r)
-    g = data.get("Global Quote", {})
-    if not g:
-        return None, None, None
-
-    price = g.get("05. price")
-    prev = g.get("08. previous close")
-    pct = g.get("10. change percent")
-
     try:
-        price = float(price) if price else None
-        prev = float(prev) if prev else None
-        pct = float(pct.replace("%", "")) if pct else None
-    except:
-        price, prev, pct = None, None, None
+        r = requests.get(url, params=params, timeout=10)
+        data = safe_json(r)
+        g = data.get("Global Quote", {}) if data else {}
+        if not g:
+            return None, None, None
 
-    return price, prev, pct
+        price = g.get("05. price")
+        prev = g.get("08. previous close")
+        pct = g.get("10. change percent")
+
+        try:
+            price = float(price) if price else None
+            prev = float(prev) if prev else None
+            pct = float(pct.replace("%", "")) if pct else None
+        except:
+            price, prev, pct = None, None, None
+
+        return price, prev, pct
+    except Exception:
+        return None, None, None
 
 
 def fetch_alpha_overview(ticker):
@@ -97,20 +103,23 @@ def fetch_alpha_overview(ticker):
         "symbol": ticker,
         "apikey": ALPHA_KEY
     }
-    r = requests.get(url, params=params, timeout=10)
-    data = safe_json(r)
-    if not data:
-        return None, None
-
-    sector = data.get("Sector")
-    mcap = data.get("MarketCapitalization")
-
     try:
-        mcap = float(mcap) if mcap else None
-    except:
-        mcap = None
+        r = requests.get(url, params=params, timeout=10)
+        data = safe_json(r)
+        if not data:
+            return None, None
 
-    return sector, mcap
+        sector = data.get("Sector")
+        mcap = data.get("MarketCapitalization")
+
+        try:
+            mcap = float(mcap) if mcap else None
+        except:
+            mcap = None
+
+        return sector, mcap
+    except Exception:
+        return None, None
 
 # --------------------------------------------------
 # MAIN FETCH LOGIC (NO ASYNC)
@@ -120,14 +129,18 @@ def fetch_alpha_overview(ticker):
 def load_live():
     rows = []
 
-    prices = yf.download(
-        tickers=NIFTY50_TICKERS,
-        period="2d",
-        interval="1d",
-        group_by="ticker",
-        threads=True,
-        progress=False
-    )
+    # bulk download prices; wrap in try so whole app doesn't crash
+    try:
+        prices = yf.download(
+            tickers=NIFTY50_TICKERS,
+            period="2d",
+            interval="1d",
+            group_by="ticker",
+            threads=True,
+            progress=False
+        )
+    except Exception:
+        prices = pd.DataFrame()
 
     for t in NIFTY50_TICKERS:
         company = t.replace(".NS", "")
@@ -140,13 +153,13 @@ def load_live():
 
         # Try Yahoo bulk price
         try:
-            if t in prices.columns.get_level_values(0):
+            if isinstance(prices, pd.DataFrame) and t in prices.columns.get_level_values(0):
                 p = prices[t]["Close"].dropna()
                 if len(p) >= 1:
                     price = float(p.iloc[-1])
                 if len(p) >= 2:
                     prev = float(p.iloc[-2])
-        except:
+        except Exception:
             pass
 
         # Try fast_info
@@ -156,18 +169,22 @@ def load_live():
                 mcap = fi.get("market_cap") or mcap
                 sector = fi.get("sector") or sector
                 company = fi.get("shortName") or company
-                source = "yahoo"
-        except:
+                if price is not None:
+                    source = "yahoo"
+        except Exception:
             pass
 
         # Compute pct
-        if price and prev and prev != 0:
-            pct = ((price - prev) / prev) * 100
+        try:
+            if price is not None and prev is not None and prev != 0:
+                pct = ((price - prev) / prev) * 100
+        except Exception:
+            pct = None
 
-        # Fallback to AlphaVantage
+        # Fallback to AlphaVantage price if missing
         if price is None:
             p, pc, pchg = fetch_alpha_global(t.replace(".NS", ""))
-            if p:
+            if p is not None:
                 price, prev, pct = p, pc, pchg
                 source = "alpha"
 
@@ -182,7 +199,7 @@ def load_live():
         rows.append({
             "Ticker": t,
             "Company": company,
-            "Sector": sector or "Unknown",
+            "Sector": sector if sector else None,
             "Price": price,
             "Prev Close": prev,
             "% Change": pct,
@@ -196,20 +213,6 @@ def load_live():
 # SANITIZER (NO CRASH EVER)
 # --------------------------------------------------
 
-def sanitize(df):
-    cleaned = {}
-    for col in df.columns:
-        s = df[col]
-
-        # if duplicate columns → a DF appears
-        if isinstance(s, pd.DataFrame):
-            for i, sub in enumerate(s.columns):
-                cleaned[f"{col}_{i}"] = s[sub].apply(_cell)
-        else:
-            cleaned[col] = s.apply(_cell)
-
-    return pd.DataFrame(cleaned)
-
 def _cell(v):
     if v is None:
         return None
@@ -218,9 +221,22 @@ def _cell(v):
     try:
         if hasattr(v, "item"):
             return v.item()
-    except:
+    except Exception:
         pass
     return v
+
+def sanitize(df):
+    cleaned = {}
+    for col in df.columns:
+        s = df[col]
+        # if duplicate columns → a DF appears
+        if isinstance(s, pd.DataFrame):
+            for i, sub in enumerate(s.columns):
+                name = f"{col}_{i}"
+                cleaned[name] = s[sub].apply(_cell)
+        else:
+            cleaned[col] = s.apply(_cell)
+    return pd.DataFrame(cleaned)
 
 # --------------------------------------------------
 # LOAD DATA
@@ -235,8 +251,8 @@ df["Prev Close"] = pd.to_numeric(df["Prev Close"], errors="coerce")
 df["% Change"] = pd.to_numeric(df["% Change"], errors="coerce")
 df["Market Cap"] = pd.to_numeric(df["Market Cap"], errors="coerce")
 
-# Recompute missing pct
-mask = df["% Change"].isna() & df["Price"].notna() & df["Prev Close"].notna()
+# Recompute missing pct where possible
+mask = df["% Change"].isna() & df["Price"].notna() & df["Prev Close"].notna() & (df["Prev Close"] != 0)
 df.loc[mask, "% Change"] = ((df.loc[mask, "Price"] - df.loc[mask, "Prev Close"]) /
                             df.loc[mask, "Prev Close"]) * 100
 
@@ -248,7 +264,8 @@ else:
     df["Market Cap Calc"] = 1.0
 
 # Stake
-df["Stake (%)"] = (df["Market Cap Calc"] / df["Market Cap Calc"].sum()) * 100
+total_cap_calc = df["Market Cap Calc"].sum() if df["Market Cap Calc"].sum() != 0 else 1.0
+df["Stake (%)"] = (df["Market Cap Calc"] / total_cap_calc) * 100
 
 # Weighted Impact
 df["Weighted Impact"] = (df["% Change"].fillna(0) * df["Stake (%)"]) / 100
@@ -257,16 +274,25 @@ df["Weighted Impact"] = (df["% Change"].fillna(0) * df["Stake (%)"]) / 100
 df["Rank"] = df["% Change"].rank(ascending=False, method="first").astype("Int64")
 
 # Sort by mcap
-df = df.sort_values("Market Cap Calc", ascending=False)
+df = df.sort_values("Market Cap Calc", ascending=False).reset_index(drop=True)
 
 # --------------------------------------------------
 # Summary Metrics
 # --------------------------------------------------
 
 c1, c2, c3 = st.columns(3)
-c1.metric("Total Gainers Impact", f"{df[df['% Change']>0]['% Change'].sum():.2f}%")
-c2.metric("Total Losers Impact", f"{df[df['% Change']<0]['% Change'].sum():.2f}%")
-c3.metric("Overall Impact", f"{df['Weighted Impact'].sum():.2f}%")
+try:
+    c1.metric("Total Gainers Impact", f"{df[df['% Change']>0]['% Change'].sum():.2f}%")
+except Exception:
+    c1.metric("Total Gainers Impact", "N/A")
+try:
+    c2.metric("Total Losers Impact", f"{df[df['% Change']<0]['% Change'].sum():.2f}%")
+except Exception:
+    c2.metric("Total Losers Impact", "N/A")
+try:
+    c3.metric("Overall Impact", f"{df['Weighted Impact'].sum():.2f}%")
+except Exception:
+    c3.metric("Overall Impact", "N/A")
 
 st.write("---")
 
@@ -279,12 +305,14 @@ tg, tl = st.columns(2)
 tg.subheader("Top 5 Gainers")
 g = df.sort_values("% Change", ascending=False).head(5)
 for _, r in g.iterrows():
-    tg.write(f"**{r['Company']}** ({r['Ticker']}): `{r['% Change']:.2f}%` — MC: {format_mcap(r['Market Cap'])}")
+    pct = r["% Change"] if pd.notna(r["% Change"]) else 0.0
+    tg.write(f"**{r['Company']}** ({r['Ticker']}): `{pct:.2f}%` — MC: {format_mcap(r['Market Cap'])}")
 
 tl.subheader("Top 5 Losers")
 l = df.sort_values("% Change", ascending=True).head(5)
 for _, r in l.iterrows():
-    tl.write(f"**{r['Company']}** ({r['Ticker']}): `{r['% Change']:.2f}%` — MC: {format_mcap(r['Market Cap'])}")
+    pct = r["% Change"] if pd.notna(r["% Change"]) else 0.0
+    tl.write(f"**{r['Company']}** ({r['Ticker']}): `{pct:.2f}%` — MC: {format_mcap(r['Market Cap'])}")
 
 st.write("---")
 
@@ -299,7 +327,7 @@ safe_table = sanitize(table)
 
 st.subheader("Company Performance")
 st.dataframe(safe_table, use_container_width=True)
-st.download_button("Download CSV", safe_table.to_csv(index=False), "nifty50.csv")
+st.download_button("Download CSV", safe_table.to_csv(index=False).encode(), "nifty50.csv", mime="text/csv")
 
 st.write("---")
 
@@ -312,16 +340,29 @@ fig1 = px.bar(df.sort_values("% Change", ascending=False),
               title="% Change by Company")
 st.plotly_chart(fig1, use_container_width=True)
 
-sector_impact = df.groupby("Sector")["Weighted Impact"].sum().reset_index()
+sector_impact = df.groupby(df["Sector"].fillna("Unknown"))["Weighted Impact"].sum().reset_index()
 fig2 = px.bar(sector_impact, x="Sector", y="Weighted Impact", title="Weighted Sector Impact")
 st.plotly_chart(fig2, use_container_width=True)
 
 fig3 = px.pie(df, values="Stake (%)", names="Company", title="Company Stake Distribution")
 st.plotly_chart(fig3, use_container_width=True)
 
-trend = df["% Change"].apply(lambda x: "Gainer" if x > 0 else "Loser").value_counts().reset_index()
-fig4 = px.pie(trend, names="index", values="% Change", title="Gainers vs Losers")
-st.plotly_chart(fig4, use_container_width=True)
+# ---------- Corrected Gainers vs Losers pie ----------
+trend_count = df["% Change"].apply(lambda x: "Gainer" if pd.notna(x) and x > 0 else "Loser").value_counts().reset_index()
+trend_count.columns = ["Trend", "Count"]
+
+if trend_count["Count"].sum() == 0:
+    st.info("No gainers/losers data to show.")
+else:
+    fig4 = px.pie(
+        trend_count,
+        names="Trend",
+        values="Count",
+        title="Gainers vs Losers Ratio",
+        color="Trend",
+        color_discrete_map={"Gainer": "green", "Loser": "red"}
+    )
+    st.plotly_chart(fig4, use_container_width=True)
 
 st.write("---")
 
@@ -332,19 +373,28 @@ st.write("---")
 st.subheader("Company Detail")
 chosen = st.selectbox("Choose company", df["Ticker"].tolist())
 
-row = df[df["Ticker"] == chosen].iloc[0]
+row = df[df["Ticker"] == chosen].iloc[0] if not df[df["Ticker"] == chosen].empty else None
 
-st.write(f"**{row['Company']}** ({chosen}) — Sector: {row['Sector']}")
-st.write(f"Price: {row['Price']} | Prev Close: {row['Prev Close']} | %: {row['% Change']:.2f}")
-st.write(f"Market Cap: {format_mcap(row['Market Cap'])}")
+if row is not None:
+    st.write(f"**{row.get('Company','-')}** ({chosen}) — Sector: {row.get('Sector') if pd.notna(row.get('Sector')) else 'Unknown'}")
+    price_display = f"{row['Price']}" if pd.notna(row['Price']) else "N/A"
+    prev_display = f"{row['Prev Close']}" if pd.notna(row['Prev Close']) else "N/A"
+    pct_display = f"{row['% Change']:.2f}%" if pd.notna(row['% Change']) else "N/A"
+    st.write(f"Price: {price_display} | Prev Close: {prev_display} | %: {pct_display}")
+    st.write(f"Market Cap: {format_mcap(row['Market Cap'])}")
+else:
+    st.info("Selected company data not available.")
 
 # History
-hist = yf.download(chosen, period="3mo")  # 90 days
-if not hist.empty:
-    fig = px.line(hist, y="Close", title=f"{chosen} - 90 Day Trend")
-    st.plotly_chart(fig, use_container_width=True)
-else:
-    st.info("History not available.")
+try:
+    hist = yf.download(chosen, period="3mo")  # 90 days
+    if not hist.empty:
+        fig = px.line(hist, y="Close", title=f"{chosen} - 90 Day Trend")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("History not available.")
+except Exception:
+    st.info("History not available (error fetching historical data).")
 
 st.write("---")
 st.caption("Stable build — No async, no crashes, all features included.")
