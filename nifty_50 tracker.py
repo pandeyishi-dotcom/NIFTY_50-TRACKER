@@ -1,24 +1,37 @@
 # app.py
+import os
+import time
+from datetime import datetime, timedelta
+import io
+import math
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import io
-import time
 
-st.set_page_config(page_title="NIFTY 50 Live Dashboard", layout="wide")
-st.title("📈 NIFTY 50 Live Performance Dashboard (Fixed & Robust)")
+# ---------------------------
+# Config & constants
+# ---------------------------
+st.set_page_config(page_title="NIFTY 50 — Robust Dashboard", layout="wide")
+st.title("📈 NIFTY 50 Live Dashboard — Yahoo / AlphaVantage / NSE Fallback (Production-grade)")
 
-# Optional: display the screenshot you uploaded while debugging (replace path if different)
-# Developer-provided image path:
+# Provide your Alpha Vantage key via env var or Streamlit secrets
+ALPHAVANTAGE_API_KEY = (
+    os.environ.get("ALPHAVANTAGE_API_KEY")
+    or (st.secrets["ALPHAVANTAGE_API_KEY"] if "ALPHAVANTAGE_API_KEY" in st.secrets else None)
+)
+
+# You can change the rotation order here if you want NSE primary, etc.
+FALLBACK_ORDER = ["yahoo", "alphavantage", "nse"]  # possible values: "yahoo", "alphavantage", "nse"
+
+# Developer debug image path (if you uploaded a screenshot)
 DEBUG_IMG_PATH = "/mnt/data/8e8d363f-d093-44cb-9a70-bc21849fe486.png"
 
-# -------------------------
-# NIFTY 50 tickers
-# -------------------------
+# NIFTY 50 tickers (Yahoo format)
 NIFTY50_TICKERS = [
     "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
     "BHARTIARTL.NS", "HINDUNILVR.NS", "ITC.NS", "KOTAKBANK.NS", "LT.NS",
@@ -32,118 +45,285 @@ NIFTY50_TICKERS = [
     "DIVISLAB.NS", "UPL.NS", "APOLLOHOSP.NS", "M&M.NS", "TATAMOTORS.NS"
 ]
 
-# -------------------------
-# Robust data loader
-# - use yf.download in bulk for price history (fast)
-# - use Ticker(...).fast_info for lightweight meta data (market cap)
-# - avoid .info completely
-# -------------------------
-@st.cache_data(ttl=300)
-def load_live_data(ticker_list):
-    # We'll fetch 2 days of close data, so we can compute today's vs previous close.
-    # Bulk call reduces requests and avoids rate-limits.
+# ---------------------------
+# Helper functions: data sources
+# ---------------------------
+
+def safe_json(r):
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+# 1) Alpha Vantage (GLOBAL_QUOTE)
+def get_alpha_vantage_quote(symbol, api_key, timeout=6):
+    """
+    symbol: without .NS, e.g., RELIANCE
+    Returns: price(float), prev_close(float), pct_change(float), market_cap(None)
+    AlphaVantage GLOBAL_QUOTE returns price & change; not market cap.
+    """
+    if not api_key:
+        return None, None, None, None, "alphavantage_no_key"
+    base = "https://www.alphavantage.co/query"
+    params = {"function": "GLOBAL_QUOTE", "symbol": symbol + ".NS", "apikey": api_key}
+    try:
+        r = requests.get(base, params=params, timeout=timeout)
+        data = safe_json(r)
+        if not data or "Global Quote" not in data:
+            return None, None, None, None, "alphavantage_no_data"
+        g = data["Global Quote"]
+        price = float(g.get("05. price")) if g.get("05. price") else None
+        prev_close = float(g.get("08. previous close")) if g.get("08. previous close") else None
+        pct_change = float(g.get("10. change percent").replace("%", "")) if g.get("10. change percent") else None
+        # Alpha Vantage does not provide market cap here — return None
+        return price, prev_close, pct_change, None, "alphavantage_ok"
+    except Exception:
+        return None, None, None, None, "alphavantage_error"
+
+# 2) NSE India LTP (public endpoint)
+def get_nse_ltp(symbol, timeout=6):
+    """
+    symbol: without .NS, e.g., RELIANCE
+    Returns: price(float), prev_close(float), pct_change(float), market_cap(None)
+    Note: NSE may block if not using proper headers. This is best-effort.
+    """
+    # The NSE endpoint for quote-equity
+    url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    session = requests.Session()
+    try:
+        # NSE sometimes requires an initial GET to root to set cookies
+        session.get("https://www.nseindia.com", headers=headers, timeout=timeout)
+        r = session.get(url, headers=headers, timeout=timeout)
+        data = safe_json(r)
+        if not data:
+            return None, None, None, None, "nse_no_data"
+        price_info = data.get("priceInfo") or {}
+        last_price = price_info.get("lastPrice") or price_info.get("last")
+        prev_close = price_info.get("previousClose")
+        pchange = price_info.get("pChange")  # percent change
+        # market cap might be in securityInfo or not present; rarely available
+        market_cap = None
+        sec_info = data.get("securityInfo") or {}
+        # sometimes 'issuedSize' exists but is not market cap; skip for safety
+        return last_price, prev_close, pchange, market_cap, "nse_ok"
+    except Exception:
+        return None, None, None, None, "nse_error"
+
+# 3) Yahoo (yfinance bulk + fast_info)
+def get_yahoo_bulk_prices(ticker_list, period_days=2):
+    """
+    Use yf.download to fetch 'period_days' worth of daily closes for all tickers in a bulk call.
+    Returns the prices DataFrame (may be multi-index columns).
+    """
     try:
         prices = yf.download(
             tickers=ticker_list,
-            period="2d",
+            period=f"{period_days}d",
             interval="1d",
             group_by="ticker",
             threads=True,
             progress=False,
             auto_adjust=False
         )
+        return prices, "yahoo_download_ok"
     except Exception:
-        prices = pd.DataFrame()
+        return pd.DataFrame(), "yahoo_download_error"
+
+def get_yahoo_fast_info(ticker):
+    """
+    Use yf.Ticker(...).fast_info to fetch market_cap and optionally shortName/sector.
+    """
+    try:
+        fi = yf.Ticker(ticker).fast_info or {}
+        # fast_info may have 'market_cap' or 'marketCap' depending on yfinance version
+        mc = fi.get("market_cap") or fi.get("marketCap") or None
+        # sector not always present in fast_info; we'll default to Unknown
+        sector = fi.get("sector") or None
+        shortName = fi.get("shortName") or None
+        return mc, sector, shortName, "yahoo_fast_ok"
+    except Exception:
+        return None, None, None, "yahoo_fast_error"
+
+# ---------------------------
+# Main loader: rotating fallback for each ticker
+# ---------------------------
+@st.cache_data(ttl=300)
+def load_live_data_with_fallback(ticker_list, fallback_order=None):
+    """
+    For each ticker:
+      - try to get today's price and prev close (and pct) using the ordered fallback.
+      - also attempt to get market_cap using Yahoo fast_info (best source).
+    Returns a DataFrame with columns:
+      ['Ticker', 'Company', 'Sector', 'Price', 'Prev Close', '% Change', 'Market Cap', 'Source']
+    """
+    fallback_order = fallback_order or FALLBACK_ORDER
+
+    # 1) Try Yahoo bulk for prices (fast)
+    prices_df, yahoo_status = get_yahoo_bulk_prices(ticker_list, period_days=2)
 
     rows = []
     for t in ticker_list:
-        try:
-            # Extract closes robustly depending on yf.download return format
-            today_close = None
-            prev_close = None
-            if isinstance(prices, pd.DataFrame) and not prices.empty:
-                # Case: yf.download with multiple tickers returns a multiindex-tracked DataFrame
-                # If group_by="ticker", we can index with [t]
-                if t in prices.columns.get_level_values(0):
-                    # columns like (Ticker, 'Close')
+        symbol = t.replace(".NS", "")
+        price = None
+        prev_close = None
+        pct_change = None
+        market_cap = None
+        company = symbol
+        sector = "Unknown"
+        source = "missing"
+
+        # Try Yahoo first if listed in fallback_order and available
+        if "yahoo" in fallback_order:
+            try:
+                # extract close series robustly
+                if isinstance(prices_df, pd.DataFrame) and not prices_df.empty:
+                    # if group_by="ticker", the columns are MultiIndex (ticker, field)
+                    if t in prices_df.columns.get_level_values(0):
+                        try:
+                            closes = prices_df[t]["Close"].dropna()
+                            if len(closes) >= 1:
+                                price = float(closes.iloc[-1])
+                            if len(closes) >= 2:
+                                prev_close = float(closes.iloc[-2])
+                        except Exception:
+                            # fallback to single-level
+                            pass
+                    else:
+                        # alternative layout when only one ticker or other edge case
+                        if "Close" in prices_df.columns:
+                            cs = prices_df["Close"].dropna()
+                            if len(cs) >= 1:
+                                price = float(cs.iloc[-1])
+                            if len(cs) >= 2:
+                                prev_close = float(cs.iloc[-2])
+                # Yahoo fast_info for market cap & company
+                mc, sec, sname, status = get_yahoo_fast_info(t)
+                if mc:
+                    market_cap = mc
+                if sec:
+                    sector = sec
+                if sname:
+                    company = sname
+                if price is not None:
+                    if prev_close is not None and prev_close != 0:
+                        pct_change = ((price - prev_close) / prev_close) * 100
+                    source = "yahoo"
+            except Exception:
+                pass
+
+        # If still missing price and AlphaVantage in order, try it
+        if (price is None or math.isnan(price)) and "alphavantage" in fallback_order:
+            # AlphaVantage uses symbol + .NS
+            p, pc, pchg, mc_av, status_av = get_alpha_vantage_quote(symbol, ALPHAVANTAGE_API_KEY)
+            if p is not None:
+                price = p
+                prev_close = pc
+                pct_change = pchg
+                if mc_av:
+                    market_cap = mc_av
+                # try to get company name via yfinance fast_info if not present
+                if company == symbol:
                     try:
-                        close_series = prices[t]["Close"].dropna()
-                        if len(close_series) >= 1:
-                            today_close = close_series.iloc[-1]
-                        if len(close_series) >= 2:
-                            prev_close = close_series.iloc[-2]
+                        _, _, sname2, _ = get_yahoo_fast_info(t)
+                        if sname2:
+                            company = sname2
                     except Exception:
                         pass
-                else:
-                    # alternative layout: single-level columns when one ticker or edge cases
-                    # try to find any "Close" column
-                    if "Close" in prices.columns:
-                        cs = prices["Close"].dropna()
-                        if len(cs) >= 1:
-                            today_close = cs.iloc[-1]
-                        if len(cs) >= 2:
-                            prev_close = cs.iloc[-2]
+                source = "alphavantage" if status_av.startswith("alphavantage_ok") or status_av.startswith("alphavantage_no_data") == False else "alphavantage"
+            else:
+                # alphavantage failed or missing
+                pass
 
-            # Fetch lightweight meta info (fast_info)
+        # If still missing price and NSE in order, try NSE
+        if (price is None or math.isnan(price)) and "nse" in fallback_order:
+            p_nse, prev_nse, pchg_nse, mc_nse, status_nse = get_nse_ltp(symbol)
+            if p_nse is not None:
+                price = p_nse
+                prev_close = prev_nse
+                pct_change = pchg_nse
+                if mc_nse:
+                    market_cap = mc_nse
+                # company name via yfinance if possible
+                if company == symbol:
+                    try:
+                        _, _, sname2, _ = get_yahoo_fast_info(t)
+                        if sname2:
+                            company = sname2
+                    except Exception:
+                        pass
+                source = "nse"
+
+        # As last resort, try to populate market cap from yahoo fast_info if not set
+        if market_cap is None:
             try:
-                fi = yf.Ticker(t).fast_info or {}
+                mc2, sec2, sname3, status = get_yahoo_fast_info(t)
+                if mc2:
+                    market_cap = mc2
+                if sec2 and sector == "Unknown":
+                    sector = sec2
+                if sname3 and company == symbol:
+                    company = sname3
             except Exception:
-                fi = {}
+                pass
 
-            # company short name fallback
-            company = fi.get("shortName") or t.replace(".NS", "")
-            # different versions: some fast_info use 'market_cap', others use 'market_cap' key
-            market_cap = fi.get("market_cap") or fi.get("marketCap") or None
-            sector = fi.get("sector") or "Unknown"
-
-            pct_change = None
-            if today_close is not None and prev_close is not None and prev_close != 0:
-                pct_change = ((today_close - prev_close) / prev_close) * 100
-
-            rows.append({
-                "Ticker": t,
-                "Company": company,
-                "Sector": sector,
-                "Price": today_close,
-                "Prev Close": prev_close,
-                "% Change": pct_change,
-                "Market Cap": market_cap
-            })
-        except Exception:
-            # Fail-safe: include a row with None values (so UI can show missing data gracefully)
-            rows.append({
-                "Ticker": t,
-                "Company": t.replace(".NS", ""),
-                "Sector": "Unknown",
-                "Price": None,
-                "Prev Close": None,
-                "% Change": None,
-                "Market Cap": None
-            })
+        rows.append({
+            "Ticker": t,
+            "Company": company,
+            "Sector": sector if sector else "Unknown",
+            "Price": price,
+            "Prev Close": prev_close,
+            "% Change": pct_change,
+            "Market Cap": market_cap,
+            "Source": source
+        })
 
     df = pd.DataFrame(rows)
 
-    # Filter out entries missing crucial fields (we keep as much as possible)
-    df = df.dropna(subset=["% Change", "Market Cap"], how="any")
-    if df.empty:
-        return df
-
-    # Some market caps might be strings or very large; ensure numeric
+    # Clean numeric market cap & % change
     df["Market Cap"] = pd.to_numeric(df["Market Cap"], errors="coerce")
-    df = df.dropna(subset=["Market Cap", "% Change"])
+    df["% Change"] = pd.to_numeric(df["% Change"], errors="coerce")
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df["Prev Close"] = pd.to_numeric(df["Prev Close"], errors="coerce")
 
+    # If market caps are missing (common), avoid crash by providing equal stake fallback:
+    # We'll compute Stake (%) in two ways:
+    # - If at least one non-null market cap exists, use market-cap weighting and set missing market caps to median of non-null
+    # - Else, use equal weight across visible tickers
+    if df["Market Cap"].notna().sum() >= 1:
+        # replace missing market caps with median of non-missing (so they don't become zero)
+        med = df.loc[df["Market Cap"].notna(), "Market Cap"].median()
+        df["Market Cap"] = df["Market Cap"].fillna(med)
+    else:
+        # no market cap info at all, give equal synthetic cap of 1 so stake becomes 1/len
+        df["Market Cap"] = 1.0
+
+    # compute stake and weighted impact, but handle missing % change gracefully
     total_cap = df["Market Cap"].sum()
-    df["Stake (%)"] = (df["Market Cap"] / total_cap) * 100
-    df["Weighted Impact"] = (df["% Change"] * df["Stake (%)"]) / 100
+    if total_cap == 0:
+        df["Stake (%)"] = 0.0
+    else:
+        df["Stake (%)"] = (df["Market Cap"] / total_cap) * 100
+
+    # Where % Change missing but Price & Prev Close present, compute it
+    mask = df["% Change"].isna() & df["Price"].notna() & df["Prev Close"].notna() & (df["Prev Close"] != 0)
+    df.loc[mask, "% Change"] = ((df.loc[mask, "Price"] - df.loc[mask, "Prev Close"]) / df.loc[mask, "Prev Close"]) * 100
+
+    df["Weighted Impact"] = (df["% Change"].fillna(0) * df["Stake (%)"]) / 100
     df["Trend"] = np.where(df["% Change"] > 0, "Gainer", "Loser")
     df["Color"] = df["% Change"].apply(lambda x: "green" if x > 0 else "red")
-    df["Abs Change"] = df["% Change"].abs()
+    df["Abs Change"] = df["% Change"].abs().fillna(0)
 
     return df
 
-# -------------------------
-# Historical fetcher for charts
-# -------------------------
+# ---------------------------
+# Historical fetcher (for sparklines & historical comparison)
+# ---------------------------
 @st.cache_data(ttl=600)
 def fetch_history_for_tickers(tickers, start_date, end_date):
     histories = {}
@@ -158,38 +338,42 @@ def fetch_history_for_tickers(tickers, start_date, end_date):
             histories[t] = pd.DataFrame()
     return histories
 
-# -------------------------
-# Sidebar controls
-# -------------------------
+# ---------------------------
+# UI: Sidebar & Controls
+# ---------------------------
 st.sidebar.header("Filters & Controls")
 with st.sidebar:
-    # Debug image toggle
     if st.checkbox("Show debug screenshot (dev)", value=False):
         try:
             st.image(DEBUG_IMG_PATH, caption="Debug screenshot", use_column_width=True)
         except Exception:
             st.info("Debug image not found at: " + DEBUG_IMG_PATH)
 
+    # Rotation order hint (info)
+    st.info(f"Data fallback order: {', '.join(FALLBACK_ORDER)}. AlphaVantage key present: {'Yes' if ALPHAVANTAGE_API_KEY else 'No'}")
+
     search = st.text_input("Search company / ticker (substring)", "")
     top_n = st.slider("Show top N movers by absolute % change", min_value=5, max_value=50, value=10, step=1)
     marketcap_min = st.number_input("Minimum market cap (crore INR) — approx", value=0.0, step=100.0)
     refresh_now = st.button("Refresh live data")
 
-# -------------------------
-# Load data
-# -------------------------
-with st.spinner("Fetching live NIFTY 50 data (robust mode)..."):
-    df_live = load_live_data(NIFTY50_TICKERS)
+# ---------------------------
+# Load the data using the rotating fallback
+# ---------------------------
+with st.spinner("Fetching live NIFTY 50 data using fallback system..."):
+    df_live = load_live_data_with_fallback(NIFTY50_TICKERS, fallback_order=FALLBACK_ORDER)
 
 if df_live is None or df_live.empty:
-    st.error("No live data available right now. Yahoo Finance may be rate-limiting or data missing.")
+    st.error("No live data could be fetched from any source. Please check your network or APIs.")
     st.stop()
 
-# populate sector filter
+# ---------------------------
+# Apply UI filters and show summary
+# ---------------------------
+# sector filter opts
 sectors = ["All"] + sorted(df_live["Sector"].fillna("Unknown").unique().tolist())
 sector_filter = st.sidebar.selectbox("Sector filter", options=sectors, index=0)
 
-# apply search and sector & marketcap filters
 df = df_live.copy()
 if search:
     mask = df["Company"].str.contains(search, case=False, na=False) | df["Ticker"].str.contains(search, case=False, na=False)
@@ -197,60 +381,56 @@ if search:
 if sector_filter != "All":
     df = df.loc[df["Sector"] == sector_filter]
 if marketcap_min and marketcap_min > 0:
-    min_val = marketcap_min * 1e7  # crore -> rupees (approx)
+    min_val = marketcap_min * 1e7  # crore -> rupees
     df = df.loc[df["Market Cap"] >= min_val]
 
-# Ranking / sorting
+# ranking & metrics
 df = df.sort_values(by="% Change", ascending=False).reset_index(drop=True)
 df["Rank"] = df["% Change"].rank(ascending=False, method="first").astype(int)
-
-# last updated info
 last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-st.caption(f"Data source: Yahoo Finance (`yfinance` bulk + fast_info). Last updated: {last_updated} (cache TTL 5min)")
 
-# Summary metrics
 total_positive = df.loc[df["% Change"] > 0, "% Change"].sum()
 total_negative = df.loc[df["% Change"] < 0, "% Change"].sum()
 overall_impact = df["Weighted Impact"].sum()
 
-col1, col2, col3, col4 = st.columns([1.5,1.5,1.5,1])
-col1.metric("Total Gainers Impact", f"{total_positive:.2f} %", delta=f"{total_positive:.2f}")
-col2.metric("Total Losers Impact", f"{total_negative:.2f} %", delta=f"{total_negative:.2f}")
-col3.metric("Overall Weighted Impact", f"{overall_impact:.2f} %", delta=f"{overall_impact:.2f}")
-col4.metric("Companies Shown", f"{len(df)}", delta=f"{len(df)}")
+c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 1])
+c1.metric("Total Gainers Impact", f"{total_positive:.2f} %", delta=f"{total_positive:.2f}")
+c2.metric("Total Losers Impact", f"{total_negative:.2f} %", delta=f"{total_negative:.2f}")
+c3.metric("Overall Weighted Impact", f"{overall_impact:.2f} %", delta=f"{overall_impact:.2f}")
+c4.metric("Companies Shown", f"{len(df)}", delta=f"{len(df)}")
+
+st.caption(f"Data sources: Yahoo / AlphaVantage / NSE (auto-rotating fallback). Last updated: {last_updated}")
 
 st.write("---")
 
-# Top gainers / losers cards
+# ---------------------------
+# Table, top movers, downloads
+# ---------------------------
 top_gainers = df.sort_values(by="% Change", ascending=False).head(5)
 top_losers = df.sort_values(by="% Change", ascending=True).head(5)
 
-gcol1, gcol2 = st.columns(2)
-with gcol1:
+g1, g2 = st.columns(2)
+with g1:
     st.subheader("Top 5 Gainers")
     for _, r in top_gainers.iterrows():
-        st.write(f"**{r['Company']}** ({r['Ticker']}) — {r['% Change']:.2f}%  — MarketCap: {int(r['Market Cap']):,}")
-with gcol2:
+        st.write(f"**{r['Company']}** ({r['Ticker']}) — {r['% Change']:.2f}% — Source: {r['Source']} — MarketCap: {int(r['Market Cap']):,}")
+with g2:
     st.subheader("Top 5 Losers")
     for _, r in top_losers.iterrows():
-        st.write(f"**{r['Company']}** ({r['Ticker']}) — {r['% Change']:.2f}%  — MarketCap: {int(r['Market Cap']):,}")
+        st.write(f"**{r['Company']}** ({r['Ticker']}) — {r['% Change']:.2f}% — Source: {r['Source']} — MarketCap: {int(r['Market Cap']):,}")
 
 st.write("---")
 
-# Prepare table for display
-table_df = df[["Rank", "Ticker", "Company", "Sector", "Stake (%)", "Price", "% Change", "Weighted Impact", "Market Cap", "Abs Change"]].copy()
+table_df = df[["Rank", "Ticker", "Company", "Sector", "Stake (%)", "Price", "% Change", "Weighted Impact", "Market Cap", "Source", "Abs Change"]].copy()
 table_df["% Change"] = table_df["% Change"].round(2)
 table_df["Stake (%)"] = table_df["Stake (%)"].round(2)
 table_df["Weighted Impact"] = table_df["Weighted Impact"].round(4)
-
-# Limit to top_n movers by abs change
 table_display = table_df.sort_values(by="Abs Change", ascending=False).head(top_n)
 
-# Download button for filtered table
+# Download CSV for filtered
 csv_buf = io.StringIO()
 table_display.to_csv(csv_buf, index=False)
-csv_bytes = csv_buf.getvalue().encode()
-st.download_button("Download filtered table as CSV", data=csv_bytes, file_name="nifty50_filtered.csv", mime="text/csv")
+st.download_button("Download filtered table as CSV", data=csv_buf.getvalue().encode(), file_name="nifty50_filtered.csv", mime="text/csv")
 
 st.subheader("🏦 Company Performance (filtered)")
 st.dataframe(table_display.drop(columns=["Abs Change"]), use_container_width=True)
@@ -274,7 +454,7 @@ with st.expander("Show mini historical charts for displayed companies (last 30 d
     for i, (_, row) in enumerate(table_display.head(12).iterrows()):
         col = cols[i % 3]
         with col:
-            st.write(f"**{row['Company']}** — {row['Ticker']}")
+            st.write(f"**{row['Company']}** — {row['Ticker']} (Source: {row['Source']})")
             fig_sp = make_sparkline(row["Ticker"])
             if fig_sp:
                 st.plotly_chart(fig_sp, use_container_width=True)
@@ -283,7 +463,9 @@ with st.expander("Show mini historical charts for displayed companies (last 30 d
 
 st.write("---")
 
-# Charts: % change by company, sector weighted impact, stake pie, gainers vs losers
+# ---------------------------
+# Charts: company changes, sector impact, pie charts
+# ---------------------------
 fig1 = px.bar(df.sort_values(by="% Change", ascending=False), x="Company", y="% Change", color="Trend",
               text="Rank", title="% Change by Company")
 fig1.update_traces(textposition="outside")
@@ -303,7 +485,6 @@ fig4 = px.pie(trend_count, names="Trend", values="Count", title="Gainers vs Lose
               color_discrete_map={"Gainer": "green", "Loser": "red"})
 st.plotly_chart(fig4, use_container_width=True)
 
-# Sector heatmap
 with st.expander("Sector vs Weighted Impact heatmap"):
     pivot = df.pivot_table(index="Sector", values="Weighted Impact", aggfunc="sum").reset_index()
     if not pivot.empty:
@@ -315,7 +496,9 @@ with st.expander("Sector vs Weighted Impact heatmap"):
 
 st.write("---")
 
+# ---------------------------
 # Historical comparison panel
+# ---------------------------
 st.subheader("Historical Comparison — Multi Company")
 default_end = datetime.now().date()
 default_start = default_end - timedelta(days=365)
@@ -347,14 +530,16 @@ if selected_companies:
 
 st.write("---")
 
+# ---------------------------
 # Company detail panel
+# ---------------------------
 st.subheader("Company Detail")
 ticker_choice = st.selectbox("Choose a single ticker to inspect", options=df["Ticker"].tolist())
 if ticker_choice:
     row = df.loc[df["Ticker"] == ticker_choice].iloc[0]
     st.write(f"**{row['Company']}** ({row['Ticker']}) — Sector: {row['Sector']}")
     st.write(f"Price: {row['Price']}, Prev Close: {row['Prev Close']}, % Change: {row['% Change']:.2f}%")
-    st.write(f"Market Cap: {int(row['Market Cap']):,}, Stake: {row['Stake (%)']:.2f}%")
+    st.write(f"Market Cap: {int(row['Market Cap']):,}, Stake: {row['Stake (%)']:.2f}%, Data source: {row['Source']}")
     hist90 = fetch_history_for_tickers([ticker_choice], datetime.now().date()-timedelta(days=90), datetime.now().date()).get(ticker_choice)
     if hist90 is not None and not hist90.empty:
         fig_o = px.line(hist90, y="Close", title=f"{row['Ticker']} — Last 90 days Close")
@@ -364,15 +549,20 @@ if ticker_choice:
         st.info("90-day history not available.")
 
 st.write("---")
-st.caption("Fixed loader: uses bulk yf.download for price data and fast_info for market cap. Avoids .info and Yahoo rate-limits. Cache TTLs reduce redundant calls.")
+st.caption("Production-grade fallback: Yahoo (bulk + fast_info) → Alpha Vantage → NSE LTP. Provide your AlphaVantage key for better resilience. Consider an enterprise feed for high-frequency production.")
 
-# Pro tips
-with st.container():
-    st.markdown(
-        """
-        **Pro tips**
-        - If you still see missing rows, try waiting a few minutes; yfinance and Yahoo can hit transient rate limits.
-        - For production use, consider a paid data provider or an official NSE feed to avoid third-party limits.
-        - If you want, I can add: intraday streaming, Redis cache, or a fallback API (NSE / AlphaVantage / TwelveData).
-        """
-    )
+# ---------------------------
+# Helpful notes & next steps
+# ---------------------------
+st.markdown(
+    """
+    **Notes & next steps**
+    - Alpha Vantage has rate limits (5 calls/min free tier). This code uses Alpha Vantage only as fallback for tickers missing from Yahoo.
+    - NSE public endpoints can be inconsistent; for production you may want a paid NSE vendor feed or a licensed market-data provider (ie. Bloomberg, Refinitiv).
+    - For intraday 1s / streaming data, integrate a websocket feed or a paid intraday API provider.
+    - If you want, I can:
+       - Add a Redis cache (shared) and background refresh worker.
+       - Add rotating API keys / throttling logic for Alpha Vantage.
+       - Add a paid fallback provider (TwelveData / Quandl / IEX / Polygon) for redundancy.
+    """
+)
