@@ -1,8 +1,22 @@
-# app.py — Robust NIFTY50 dashboard (sync, production-safe)
+# app.py — Robust NIFTY50 dashboard (sync, production-ready)
+# Features:
+# - Yahoo (yfinance) bulk -> fast_info -> AlphaVantage -> NSE fallback (prices & metadata)
+# - AlphaVantage rate-limited polite calls (OVERVIEW & TIME_SERIES) if key provided
+# - Robust history fallback for mini-charts and 90d history
+# - Sanitize DataFrame for Streamlit (no Arrow errors)
+# - Sector override CSV support (sectors_override.csv)
+# - Diagnostics panel to inspect per-ticker source
+# - No async / no aiohttp (works on Streamlit Cloud)
+# - Helpful in-app messages when data is missing
+#
+# Put ALPHAVANTAGE_API_KEY into Streamlit secrets or env if you want fuller metadata.
+# Optional: add sectors_override.csv with columns Ticker,Sector (example: RELIANCE.NS,Energy)
+
 import os
 import math
 import time
 from datetime import datetime, timedelta
+from typing import Tuple
 
 import streamlit as st
 import pandas as pd
@@ -12,12 +26,13 @@ import requests
 import plotly.express as px
 import plotly.graph_objects as go
 
-# -----------------------
+# ------------------------------------------------------------
 # Config
-# -----------------------
+# ------------------------------------------------------------
 st.set_page_config(page_title="NIFTY50 Robust Dashboard", layout="wide")
 st.title("📈 NIFTY 50 — Robust Dashboard (stable)")
 
+# NIFTY50 tickers (Yahoo format)
 NIFTY50_TICKERS = [
     "RELIANCE.NS","TCS.NS","INFY.NS","HDFCBANK.NS","ICICIBANK.NS",
     "BHARTIARTL.NS","HINDUNILVR.NS","ITC.NS","KOTAKBANK.NS","LT.NS",
@@ -32,11 +47,11 @@ NIFTY50_TICKERS = [
 ]
 
 ALPHA_KEY = os.environ.get("ALPHAVANTAGE_API_KEY") or (st.secrets.get("ALPHAVANTAGE_API_KEY") if "ALPHAVANTAGE_API_KEY" in st.secrets else None)
-SECTOR_OVERRIDE_PATH = "sectors_override.csv"  # optional local CSV you can provide
+SECTOR_OVERRIDE_PATH = "sectors_override.csv"  # optional file to guarantee sectors
 
-# -----------------------
+# ------------------------------------------------------------
 # Utilities
-# -----------------------
+# ------------------------------------------------------------
 def safe_json(resp):
     try:
         return resp.json()
@@ -65,27 +80,48 @@ def _cell(v):
         pass
     return v
 
-def sanitize_for_streamlit(df):
-    """Make DataFrame Arrow-safe and handle duplicate column names."""
+def sanitize_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Flatten duplicate columns and sanitize cells to be Arrow-friendly.
+    """
     cleaned = {}
     for col in df.columns:
-        series = df[col]
-        if isinstance(series, pd.DataFrame):
-            for i, subcol in enumerate(series.columns):
-                cleaned[f"{col}_{i}"] = series[subcol].apply(_cell)
+        s = df[col]
+        if isinstance(s, pd.DataFrame):
+            # duplicate column name case
+            for i, subcol in enumerate(s.columns):
+                cleaned[f"{col}_{i}"] = s[subcol].apply(_cell)
         else:
-            cleaned[col] = series.apply(_cell)
+            cleaned[col] = s.apply(_cell)
     return pd.DataFrame(cleaned)
 
-# -----------------------
-# Data source helpers (sync)
-# -----------------------
-def alpha_global_quote(symbol_no_ns):
-    """AlphaVantage GLOBAL_QUOTE — price, prev, pct"""
+# ------------------------------------------------------------
+# AlphaVantage polite rate limiter (very simple)
+# ------------------------------------------------------------
+class SimpleAlphaLimiter:
+    def __init__(self, calls_per_min=5):
+        self.interval = 60.0 / max(1, calls_per_min)
+        self._last = 0.0
+
+    def wait(self):
+        now = time.time()
+        diff = now - self._last
+        if diff < self.interval:
+            time.sleep(self.interval - diff)
+        self._last = time.time()
+
+ALPHA_LIMITER = SimpleAlphaLimiter(calls_per_min=5)
+
+# ------------------------------------------------------------
+# Data-source helpers
+# ------------------------------------------------------------
+def alpha_global_quote(sym_no_ns: str) -> Tuple[float, float, float]:
+    """AlphaVantage GLOBAL_QUOTE => price, previous close, pct change."""
     if not ALPHA_KEY:
         return None, None, None
+    ALPHA_LIMITER.wait()
     url = "https://www.alphavantage.co/query"
-    params = {"function": "GLOBAL_QUOTE", "symbol": symbol_no_ns + ".NS", "apikey": ALPHA_KEY}
+    params = {"function": "GLOBAL_QUOTE", "symbol": sym_no_ns + ".NS", "apikey": ALPHA_KEY}
     try:
         r = requests.get(url, params=params, timeout=10)
         data = safe_json(r)
@@ -105,12 +141,13 @@ def alpha_global_quote(symbol_no_ns):
     except Exception:
         return None, None, None
 
-def alpha_overview(symbol_no_ns):
-    """AlphaVantage OVERVIEW — sector, market capitalization"""
+def alpha_overview(sym_no_ns: str) -> Tuple[str, float]:
+    """AlphaVantage OVERVIEW => sector, marketcap"""
     if not ALPHA_KEY:
         return None, None
+    ALPHA_LIMITER.wait()
     url = "https://www.alphavantage.co/query"
-    params = {"function": "OVERVIEW", "symbol": symbol_no_ns + ".NS", "apikey": ALPHA_KEY}
+    params = {"function": "OVERVIEW", "symbol": sym_no_ns + ".NS", "apikey": ALPHA_KEY}
     try:
         r = requests.get(url, params=params, timeout=10)
         data = safe_json(r)
@@ -126,50 +163,22 @@ def alpha_overview(symbol_no_ns):
     except Exception:
         return None, None
 
-def nse_quote(symbol_no_ns):
-    """Best-effort NSE quote & sector (may fail due to site protection)."""
-    url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol_no_ns}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.nseindia.com/",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-    }
-    s = requests.Session()
-    try:
-        s.get("https://www.nseindia.com", headers=headers, timeout=5)
-        r = s.get(url, headers=headers, timeout=8)
-        data = safe_json(r)
-        if not data:
-            return None, None, None, None
-        price_info = data.get("priceInfo") or {}
-        last = price_info.get("lastPrice") or price_info.get("last")
-        prev = price_info.get("previousClose")
-        pchange = price_info.get("pChange")
-        secinfo = data.get("securityInfo") or {}
-        sector = secinfo.get("industry") or secinfo.get("industryType")
-        return last, prev, pchange, sector
-    except Exception:
-        return None, None, None, None
-
-# -----------------------
-# Historical fallback helpers
-# -----------------------
-def alphavantage_time_series_df(symbol_no_ns, start_date, end_date):
-    """AlphaVantage TIME_SERIES_DAILY_ADJUSTED -> DataFrame with Close column in date range."""
+def alpha_time_series(sym_no_ns: str, start_date, end_date) -> pd.DataFrame:
+    """AlphaVantage TIME_SERIES_DAILY_ADJUSTED fallback (returns df with Close column)."""
     if not ALPHA_KEY:
         return pd.DataFrame()
+    ALPHA_LIMITER.wait()
     url = "https://www.alphavantage.co/query"
-    params = {"function": "TIME_SERIES_DAILY_ADJUSTED", "symbol": symbol_no_ns + ".NS", "outputsize": "full", "apikey": ALPHA_KEY}
+    params = {"function":"TIME_SERIES_DAILY_ADJUSTED","symbol":sym_no_ns + ".NS","outputsize":"full","apikey":ALPHA_KEY}
     try:
         r = requests.get(url, params=params, timeout=12)
-        data = r.json()
+        data = safe_json(r)
         ts = data.get("Time Series (Daily)") or {}
         if not ts:
             return pd.DataFrame()
         rows = []
-        for date_str, vals in ts.items():
-            d = pd.to_datetime(date_str)
+        for dstr, vals in ts.items():
+            d = pd.to_datetime(dstr)
             if d.date() < start_date or d.date() > end_date:
                 continue
             close = vals.get("5. adjusted close") or vals.get("4. close")
@@ -183,16 +192,52 @@ def alphavantage_time_series_df(symbol_no_ns, start_date, end_date):
     except Exception:
         return pd.DataFrame()
 
-def get_history_for_ticker(ticker, start_date, end_date):
-    """Robust history: try yfinance download, yf.Ticker.history, then AlphaVantage."""
-    # yfinance download
+def nse_quote(sym_no_ns: str):
+    """Try NSE public endpoint (best-effort). May fail due to site protections."""
+    url = f"https://www.nseindia.com/api/quote-equity?symbol={sym_no_ns}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+    }
+    s = requests.Session()
+    try:
+        # ping homepage to set cookies
+        s.get("https://www.nseindia.com", headers=headers, timeout=5)
+        r = s.get(url, headers=headers, timeout=8)
+        data = safe_json(r)
+        if not data:
+            return None, None, None, None
+        price_info = data.get("priceInfo") or {}
+        last = price_info.get("lastPrice") or price_info.get("last")
+        prev = price_info.get("previousClose")
+        pchg = price_info.get("pChange")
+        secinfo = data.get("securityInfo") or {}
+        sector = secinfo.get("industry") or secinfo.get("industryType")
+        return last, prev, pchg, sector
+    except Exception:
+        return None, None, None, None
+
+# ------------------------------------------------------------
+# History robust fallback
+# ------------------------------------------------------------
+def get_history_for_ticker(ticker: str, start_date, end_date) -> pd.DataFrame:
+    """
+    Try multiple methods for history:
+      1) yf.download (fast)
+      2) yf.Ticker.history
+      3) AlphaVantage TIME_SERIES (if key)
+    """
+    # 1) yfinance download
     try:
         df = yf.download(ticker, start=start_date, end=end_date + timedelta(days=1), progress=False)
         if df is not None and not df.empty and "Close" in df.columns:
             return df[["Close"]]
     except Exception:
         pass
-    # yf.Ticker.history
+
+    # 2) Ticker.history
     try:
         t = yf.Ticker(ticker)
         h = t.history(start=start_date, end=end_date + timedelta(days=1), interval="1d", actions=False)
@@ -200,22 +245,24 @@ def get_history_for_ticker(ticker, start_date, end_date):
             return h[["Close"]]
     except Exception:
         pass
-    # AlphaVantage fallback
+
+    # 3) AlphaVantage fallback
     if ALPHA_KEY:
         sym = ticker.replace(".NS", "")
-        df_av = alphavantage_time_series_df(sym, start_date, end_date)
+        df_av = alpha_time_series(sym, start_date, end_date)
         if df_av is not None and not df_av.empty:
             return df_av
+
     return pd.DataFrame()
 
-# -----------------------
+# ------------------------------------------------------------
 # Sector override loader
-# -----------------------
-def load_sector_override(path=SECTOR_OVERRIDE_PATH):
+# ------------------------------------------------------------
+def load_sector_override(path=SECTOR_OVERRIDE_PATH) -> dict:
     if os.path.exists(path):
         try:
             so = pd.read_csv(path)
-            if {"Ticker", "Sector"}.issubset(so.columns):
+            if {"Ticker","Sector"}.issubset(set(so.columns)):
                 return dict(zip(so["Ticker"].astype(str).str.upper(), so["Sector"]))
         except Exception:
             pass
@@ -223,20 +270,20 @@ def load_sector_override(path=SECTOR_OVERRIDE_PATH):
 
 SECTOR_OVERRIDE = load_sector_override()
 
-# -----------------------
-# Main loader (cached)
-# -----------------------
-@st.cache_data(ttl=150)
+# ------------------------------------------------------------
+# Master loader (cached)
+# ------------------------------------------------------------
+@st.cache_data(ttl=180)
 def load_live_data(tickers):
     rows = []
-    # Bulk yfinance (fast); wrap in try
+    # attempt bulk yfinance download
     try:
         prices = yf.download(tickers=tickers, period="2d", interval="1d", group_by="ticker", threads=True, progress=False, auto_adjust=False)
     except Exception:
         prices = pd.DataFrame()
 
     for t in tickers:
-        sym = t.replace(".NS", "")
+        sym = t.replace(".NS","")
         company = sym
         price = None
         prev = None
@@ -256,7 +303,7 @@ def load_live_data(tickers):
         except Exception:
             pass
 
-        # 2) yahoo fast_info metadata
+        # 2) fast_info metadata (market cap & maybe sector)
         try:
             fi = yf.Ticker(t).fast_info
             if fi:
@@ -269,20 +316,20 @@ def load_live_data(tickers):
             pass
 
         # compute pct if possible
-        if price is not None and prev is not None and prev != 0:
-            try:
+        try:
+            if price is not None and prev is not None and prev != 0:
                 pct = ((price - prev) / prev) * 100
-            except Exception:
-                pct = None
+        except Exception:
+            pct = None
 
-        # 3) Alpha price fallback
+        # 3) alpha price fallback
         if price is None:
             p, pc, pchg = alpha_global_quote(sym)
             if p is not None:
                 price, prev, pct = p, pc, pchg
                 source = source or "alpha"
 
-        # 4) NSE best-effort fallback for price/sector
+        # 4) nse fallback for price & sector
         if price is None or sector is None:
             n_price, n_prev, n_pchg, n_sector = nse_quote(sym)
             if n_price is not None and price is None:
@@ -291,7 +338,7 @@ def load_live_data(tickers):
             if n_sector and sector is None:
                 sector = n_sector
 
-        # 5) Alpha overview for sector & market cap if missing (use sparingly)
+        # 5) alpha overview for sector & mcap (only for missing ones)
         if (sector is None or mcap is None) and ALPHA_KEY:
             sec_av, mcap_av = alpha_overview(sym)
             if sec_av and sector is None:
@@ -309,9 +356,10 @@ def load_live_data(tickers):
             "Market Cap": mcap,
             "Source": source or "unknown"
         })
+
     df = pd.DataFrame(rows)
 
-    # 6) Apply local sector override (if provided)
+    # apply sector override if provided (priority)
     if SECTOR_OVERRIDE:
         df["Ticker_upper"] = df["Ticker"].astype(str).str.upper()
         df["Sector"] = df.apply(lambda r: SECTOR_OVERRIDE.get(r["Ticker_upper"], r["Sector"]), axis=1)
@@ -319,30 +367,27 @@ def load_live_data(tickers):
 
     return df
 
-# -----------------------
-# Run loader
-# -----------------------
+# ------------------------------------------------------------
+# Run loader & cleaning
+# ------------------------------------------------------------
 with st.spinner("Fetching live data..."):
     df = load_live_data(NIFTY50_TICKERS)
 
 if df is None or df.empty:
-    st.error("No data loaded. Check network, yfinance, and ALPHAVANTAGE_API_KEY (optional).")
+    st.error("No data loaded. Check network and API keys.")
     st.stop()
 
-# -----------------------
-# Clean & compute
-# -----------------------
 # numeric coercion
 df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
 df["Prev Close"] = pd.to_numeric(df["Prev Close"], errors="coerce")
 df["% Change"] = pd.to_numeric(df["% Change"], errors="coerce")
 df["Market Cap"] = pd.to_numeric(df["Market Cap"], errors="coerce")
 
-# compute missing % change
+# recompute missing percentage where possible
 mask = df["% Change"].isna() & df["Price"].notna() & df["Prev Close"].notna() & (df["Prev Close"] != 0)
 df.loc[mask, "% Change"] = ((df.loc[mask, "Price"] - df.loc[mask, "Prev Close"]) / df.loc[mask, "Prev Close"]) * 100
 
-# Market cap calc for weighting (do not surface this as real market cap)
+# Market cap calc for weighting only
 if df["Market Cap"].notna().sum() >= 1:
     med = df.loc[df["Market Cap"].notna(), "Market Cap"].median()
     df["Market Cap Calc"] = df["Market Cap"].fillna(med)
@@ -354,26 +399,28 @@ total_calc = df["Market Cap Calc"].sum() if df["Market Cap Calc"].sum() != 0 els
 df["Stake (%)"] = (df["Market Cap Calc"] / total_calc) * 100
 df["Weighted Impact"] = (df["% Change"].fillna(0) * df["Stake (%)"]) / 100
 
-# Trend & rank
+# trend & rank
 df["Trend"] = np.where(df["% Change"] > 0, "Gainer", "Loser")
-df["Rank_raw"] = df["% Change"].rank(ascending=False, method="first")
+r_raw = df["% Change"].rank(ascending=False, method="first")
 try:
-    df["Rank"] = df["Rank_raw"].astype("Int64")
+    df["Rank"] = r_raw.astype("Int64")
 except Exception:
-    df["Rank"] = df["Rank_raw"].fillna(0).astype(int)
+    df["Rank"] = r_raw.fillna(0).astype(int)
 
 # sort by market cap calc desc
 df = df.sort_values("Market Cap Calc", ascending=False).reset_index(drop=True)
 
-# -----------------------
-# Sidebar filters
-# -----------------------
-st.sidebar.header("Controls")
+# ------------------------------------------------------------
+# Controls (sidebar)
+# ------------------------------------------------------------
+st.sidebar.header("Filters & Controls")
 search = st.sidebar.text_input("Search company / ticker (substring)", value="")
-sectors = ["All"] + sorted(df["Sector"].fillna("Unknown").unique().tolist())
-sector_sel = st.sidebar.selectbox("Sector filter", sectors, index=0)
+sector_options = ["All"] + sorted(df["Sector"].fillna("Unknown").unique().tolist())
+sector_sel = st.sidebar.selectbox("Sector filter", sector_options, index=0)
 min_mcap_crore = st.sidebar.number_input("Minimum market cap (crore INR)", value=0.0, step=100.0)
-refresh = st.sidebar.button("Refresh data (clear cache)")
+if st.sidebar.button("Refresh (clear cache)"):
+    st.cache_data.clear()
+    st.experimental_rerun()
 
 # Apply filters
 display_df = df.copy()
@@ -387,9 +434,9 @@ if sector_sel != "All":
 if min_mcap_crore > 0:
     display_df = display_df[display_df["Market Cap Calc"] >= (min_mcap_crore * 1e7)]
 
-# -----------------------
-# Top metrics
-# -----------------------
+# ------------------------------------------------------------
+# Key metrics
+# ------------------------------------------------------------
 tot_pos = display_df.loc[display_df["% Change"] > 0, "% Change"].sum()
 tot_neg = display_df.loc[display_df["% Change"] < 0, "% Change"].sum()
 overall_impact = display_df["Weighted Impact"].sum()
@@ -400,16 +447,16 @@ c2.metric("Total Losers Impact", f"{tot_neg:.2f} %")
 c3.metric("Overall Weighted Impact", f"{overall_impact:.2f} %")
 st.write("---")
 
-# -----------------------
+# ------------------------------------------------------------
 # Top movers
-# -----------------------
-tg, tl = st.columns(2)
-with tg:
+# ------------------------------------------------------------
+left, right = st.columns(2)
+with left:
     st.subheader("Top 5 Gainers")
     for _, r in display_df.sort_values("% Change", ascending=False).head(5).iterrows():
         pct = r["% Change"] if pd.notna(r["% Change"]) else 0.0
         st.markdown(f"**{r['Company']}** ({r['Ticker']}) — `{pct:.2f}%` — MC: **{format_mcap_display(r['Market Cap'])}** — Source: {r['Source']}")
-with tl:
+with right:
     st.subheader("Top 5 Losers")
     for _, r in display_df.sort_values("% Change", ascending=True).head(5).iterrows():
         pct = r["% Change"] if pd.notna(r["% Change"]) else 0.0
@@ -417,23 +464,25 @@ with tl:
 
 st.write("---")
 
-# -----------------------
-# Table
-# -----------------------
+# ------------------------------------------------------------
+# Table (sanitized)
+# ------------------------------------------------------------
 table = display_df[["Rank","Ticker","Company","Sector","Stake (%)","Price","% Change","Weighted Impact","Market Cap","Source"]].copy()
 table["Stake (%)"] = table["Stake (%)"].round(2)
 table["% Change"] = table["% Change"].round(2)
 table["Weighted Impact"] = table["Weighted Impact"].round(4)
 table["Market Cap"] = table["Market Cap"].apply(format_mcap_display)
+
 safe_table = sanitize_for_streamlit(table)
 st.subheader("Company Performance")
 st.dataframe(safe_table, use_container_width=True)
 st.download_button("Download filtered table (CSV)", data=safe_table.to_csv(index=False).encode(), file_name="nifty50_filtered.csv", mime="text/csv")
+
 st.write("---")
 
-# -----------------------
-# Mini history charts (last 30 days)
-# -----------------------
+# ------------------------------------------------------------
+# Mini historical charts (last 30 days)
+# ------------------------------------------------------------
 with st.expander("Mini historical charts for displayed companies (last 30 days)"):
     tickers_to_show = table["Ticker"].tolist()[:12]
     end = datetime.now().date()
@@ -454,14 +503,13 @@ with st.expander("Mini historical charts for displayed companies (last 30 days)"
 
 st.write("---")
 
-# -----------------------
-# Charts
-# -----------------------
+# ------------------------------------------------------------
+# Charts & sector impact
+# ------------------------------------------------------------
 fig_pct = px.bar(display_df.sort_values("% Change", ascending=False), x="Company", y="% Change", color="Trend", title="% Change by Company")
 fig_pct.update_traces(texttemplate="%{y:.2f}", textposition="outside")
 st.plotly_chart(fig_pct, use_container_width=True)
 
-# Sector impact
 sector_impact = df.groupby(df["Sector"].fillna("Unknown"))["Weighted Impact"].sum().reset_index()
 if len(sector_impact) <= 1:
     st.warning("Sector metadata limited or absent. Sector breakdown may be unavailable.")
@@ -469,11 +517,11 @@ else:
     st.subheader("Weighted Sector Impact")
     st.plotly_chart(px.bar(sector_impact.sort_values("Weighted Impact"), x="Sector", y="Weighted Impact", color="Weighted Impact", title="Weighted Sector Impact", color_continuous_scale=px.colors.diverging.RdYlGn), use_container_width=True)
 
-# Company stake distribution (top 20)
+# stake pie (top 20)
 stake_df = df.sort_values("Market Cap Calc", ascending=False).head(20)
 st.plotly_chart(px.pie(stake_df, values="Stake (%)", names="Company", title="Company Stake Distribution (Top 20)"), use_container_width=True)
 
-# Gainers vs losers pie (counts)
+# gainers vs losers (counts)
 trend_count = display_df["Trend"].value_counts().rename_axis("Trend").reset_index(name="Count")
 if trend_count["Count"].sum() == 0:
     st.info("No gainers/losers to display.")
@@ -482,9 +530,9 @@ else:
 
 st.write("---")
 
-# -----------------------
-# Company detail
-# -----------------------
+# ------------------------------------------------------------
+# Company detail & 90d history
+# ------------------------------------------------------------
 st.subheader("Company Detail")
 choice = st.selectbox("Choose a single ticker to inspect", options=df["Ticker"].tolist())
 selected = df[df["Ticker"] == choice] if choice else pd.DataFrame()
@@ -496,7 +544,7 @@ if not selected.empty:
     pct_display = f"{r['% Change']:.2f}%" if pd.notna(r['% Change']) else "N/A"
     st.markdown(f"Price: **{price_display}** | Prev Close: **{prev_display}** | % Change: **{pct_display}**")
     st.markdown(f"Market Cap: **{format_mcap_display(r['Market Cap'])}** — Stake: **{r['Stake (%)']:.2f}%** — Source: {r['Source']}")
-    # 90-day history
+    # 90-day history (robust)
     try:
         hist90 = get_history_for_ticker(r["Ticker"], datetime.now().date() - timedelta(days=90), datetime.now().date())
         if hist90 is not None and not hist90.empty:
@@ -511,11 +559,11 @@ else:
 
 st.write("---")
 
-# -----------------------
+# ------------------------------------------------------------
 # Diagnostics
-# -----------------------
-with st.expander("Data source diagnostics (first 100 rows)"):
+# ------------------------------------------------------------
+with st.expander("Data source diagnostics (first 200 rows)"):
     diag = df[["Ticker","Company","Source","Price","Prev Close","Market Cap","Sector","% Change"]].copy()
     st.dataframe(sanitize_for_streamlit(diag), use_container_width=True)
 
-st.caption("If many rows show Source=nse and histories missing, set ALPHAVANTAGE_API_KEY in Streamlit secrets and/or add sectors_override.csv for sectors & market caps.")
+st.caption("If many rows show Source=nse and histories missing, set ALPHAVANTAGE_API_KEY in Streamlit secrets and/or add sectors_override.csv for sectors & market caps. I inspected your earlier error file at /mnt/data/error.pdf for diagnosis.")
