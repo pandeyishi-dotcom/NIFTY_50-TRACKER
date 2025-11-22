@@ -6,3 +6,5 @@ plotly==5.24.1
 requests==2.32.3
 beautifulsoup4==4.12.3
 lxml==5.2.2
+aiohttp==3.8.4
+aioredis==2.0.0   # if you want the Redis parts too
